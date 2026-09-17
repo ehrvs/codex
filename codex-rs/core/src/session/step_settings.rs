@@ -204,6 +204,9 @@ impl ModelInfoOverrides {
     ) -> ModelsManagerConfig {
         ModelsManagerConfig {
             model_context_window: self.context_window,
+            // Per-step overrides do not carry an apply_patch tool-type override;
+            // that flows from Config::to_models_manager_config.
+            model_apply_patch_tool_type: None,
             model_auto_compact_token_limit: self.auto_compact_token_limit,
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),

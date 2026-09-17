@@ -14,6 +14,7 @@ use codex_login::CodexAuth;
 use codex_login::WorkspaceRoutingRequest;
 use codex_login::default_client::ClientRedirectPolicy;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::cache::ModelsCache;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
@@ -389,9 +390,22 @@ impl ModelProvider for ConfiguredModelProvider {
             RemoteCompactionSupport::Unsupported
         };
 
-        ProviderCapabilities {
+        let default_capabilities = ProviderCapabilities {
             remote_compaction,
             ..ProviderCapabilities::default()
+        };
+
+        match self.info.wire_api {
+            // The Chat Completions wire format cannot express OpenAI's hosted
+            // server-side tools, so disable everything that relies on them.
+            WireApi::Chat => ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+                external_web_access: false,
+                ..default_capabilities
+            },
+            WireApi::Responses => default_capabilities,
         }
     }
 
@@ -684,6 +698,31 @@ mod tests {
             provider.capabilities(),
             ProviderCapabilities {
                 remote_compaction: RemoteCompactionSupport::V2,
+                ..ProviderCapabilities::default()
+            }
+        );
+    }
+
+    #[test]
+    fn configured_provider_disables_hosted_tools_for_chat_wire_api() {
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "chat-provider".to_string(),
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                wire_api: WireApi::Chat,
+                requires_openai_auth: false,
+                ..Default::default()
+            },
+            /*auth_manager*/ None,
+        );
+
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+                external_web_access: false,
                 ..ProviderCapabilities::default()
             }
         );

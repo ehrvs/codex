@@ -25,6 +25,7 @@ use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
 use crate::tools::handlers::file_system_sandbox_policy_context_for_cwd;
+use crate::tools::handlers::apply_patch_spec::create_apply_patch_function_tool;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
@@ -47,6 +48,7 @@ use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::permissions::FileSystemSandboxPolicyContext;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -72,16 +74,23 @@ fn apply_patch_file_update_mode(turn: &TurnContext) -> ApplyPatchFileUpdateMode 
     }
 }
 
-/// Handles freeform `apply_patch` requests and routes verified patches to the
-/// selected environment filesystem.
+/// Handles `apply_patch` requests (freeform or function-style) and routes
+/// verified patches to the selected environment filesystem.
 #[derive(Default)]
 pub struct ApplyPatchHandler {
     multi_environment: bool,
+    tool_type: Option<ApplyPatchToolType>,
 }
 
 impl ApplyPatchHandler {
-    pub(crate) fn new(multi_environment: bool) -> Self {
-        Self { multi_environment }
+    pub(crate) fn new_with_type(
+        multi_environment: bool,
+        tool_type: Option<ApplyPatchToolType>,
+    ) -> Self {
+        Self {
+            multi_environment,
+            tool_type,
+        }
     }
 }
 
@@ -344,7 +353,14 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_apply_patch_freeform_tool(self.multi_environment)
+        match self.tool_type {
+            Some(ApplyPatchToolType::Function) => {
+                create_apply_patch_function_tool(self.multi_environment)
+            }
+            Some(ApplyPatchToolType::Freeform) | None => {
+                create_apply_patch_freeform_tool(self.multi_environment)
+            }
+        }
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -372,10 +388,29 @@ impl ApplyPatchHandler {
             ..
         } = invocation;
 
-        let ToolPayload::Custom { input: patch_input } = payload else {
-            return Err(FunctionCallError::RespondToModel(
-                "apply_patch handler received unsupported payload".to_string(),
-            ));
+        let patch_input = match payload {
+            ToolPayload::Custom { input } => input,
+            ToolPayload::Function { arguments } => {
+                let parsed: serde_json::Value = serde_json::from_str(&arguments).map_err(|e| {
+                    FunctionCallError::RespondToModel(format!(
+                        "apply_patch handler received invalid JSON arguments: {e}"
+                    ))
+                })?;
+                parsed
+                    .get("input")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(
+                            "apply_patch function call missing `input` field".to_string(),
+                        )
+                    })?
+                    .to_string()
+            }
+            _ => {
+                return Err(FunctionCallError::RespondToModel(
+                    "apply_patch handler received unsupported payload".to_string(),
+                ));
+            }
         };
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
@@ -448,7 +483,10 @@ impl ApplyPatchHandler {
 
 impl CoreToolRuntime for ApplyPatchHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Custom { .. })
+        matches!(
+            payload,
+            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
+        )
     }
 
     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {

@@ -1033,6 +1033,7 @@ fn should_include_windows_shell_guidance(environments: &TurnEnvironmentSnapshot)
     }
 }
 
+
 #[instrument(level = "trace", skip_all)]
 fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
@@ -1067,11 +1068,32 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     if features.enabled(Feature::UnifiedExec) {
         registry.add(ExecCommandHandler::new(options));
         registry.add(WriteStdinHandler);
+        add_local_model_shell_aliases(registry, options);
     } else {
         // Managed requirements are the only configuration path that can keep
         // unified exec disabled. Preserve command execution without exposing a
         // resumable process or write_stdin authority prohibited by policy.
         registry.add(ExecCommandHandler::one_shot(options));
+        add_local_model_shell_aliases(registry, options);
+    }
+}
+
+/// Tool names local models emit instead of upstream's `exec_command`.
+///
+/// Models served over the Chat Completions wire (qwen3-coder and friends via
+/// Ollama) call the shell with these names. Registering hidden aliases routes
+/// them to the real handler instead of producing an "unsupported call" error.
+const LOCAL_MODEL_SHELL_ALIASES: &[&str] = &["exec", "shell", "shell_command"];
+
+/// Register dispatch-only aliases for the shell path. They are `Hidden`, so they
+/// are routable but never advertised in the model-visible tool list -- first-party
+/// models keep seeing exactly one shell tool.
+fn add_local_model_shell_aliases(registry: &mut ToolRegistry, options: ExecCommandHandlerOptions) {
+    for alias in LOCAL_MODEL_SHELL_ALIASES {
+        registry.add_with_exposure(
+            ExecCommandHandler::new_alias(options, ToolName::plain(*alias)),
+            ToolExposure::Hidden,
+        );
     }
 }
 
@@ -1216,7 +1238,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 
     if environment_mode.has_environment() && context.model_info.apply_patch_tool_type.is_some() {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-        registry.add(ApplyPatchHandler::new(include_environment_id));
+        registry.add(ApplyPatchHandler::new_with_type(
+            include_environment_id,
+            turn_context.model_info().apply_patch_tool_type.clone(),
+        ));
     }
 
     if context

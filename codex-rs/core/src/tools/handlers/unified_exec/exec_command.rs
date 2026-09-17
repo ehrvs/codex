@@ -75,12 +75,22 @@ enum ExecCommandLifetime {
 pub struct ExecCommandHandler {
     options: ExecCommandHandlerOptions,
     lifetime: ExecCommandLifetime,
+    /// When `Some`, overrides the value returned by `tool_name()`. Used to register
+    /// dispatch-only aliases (e.g. `exec`, `shell`) that share all execution logic
+    /// with the primary handler but answer to a different name, so local models
+    /// served over the Chat Completions wire -- which emit non-standard tool names
+    /// -- are routed to the shell path instead of erroring as "unsupported call".
+    ///
+    /// Re-derived for the upstream unified-exec registry; the predecessor fork hung
+    /// this off `ShellCommandHandler`, which upstream has since removed.
+    name_override: Option<ToolName>,
 }
 
 impl Default for ExecCommandHandler {
     fn default() -> Self {
         Self {
             lifetime: ExecCommandLifetime::Interactive,
+            name_override: None,
             options: ExecCommandHandlerOptions {
                 allow_login_shell: false,
                 allow_tty: true,
@@ -98,6 +108,7 @@ impl ExecCommandHandler {
         Self {
             options,
             lifetime: ExecCommandLifetime::Interactive,
+            name_override: None,
         }
     }
 
@@ -105,13 +116,27 @@ impl ExecCommandHandler {
         Self {
             options,
             lifetime: ExecCommandLifetime::OneShot,
+            name_override: None,
+        }
+    }
+
+    /// Create a dispatch-only alias that shares all execution logic with the
+    /// primary handler but reports `name` as its tool name. Register it with
+    /// `ToolExposure::Hidden` so it is routable but never advertised to the model.
+    pub(crate) fn new_alias(options: ExecCommandHandlerOptions, name: ToolName) -> Self {
+        Self {
+            options,
+            lifetime: ExecCommandLifetime::Interactive,
+            name_override: Some(name),
         }
     }
 }
 
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn tool_name(&self) -> ToolName {
-        ToolName::plain("exec_command")
+        self.name_override
+            .clone()
+            .unwrap_or_else(|| ToolName::plain("exec_command"))
     }
 
     fn spec(&self) -> ToolSpec {
