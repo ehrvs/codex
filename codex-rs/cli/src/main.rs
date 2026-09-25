@@ -64,6 +64,7 @@ mod exec_server_args_tests;
 mod exec_server_auth;
 mod exec_server_command;
 mod exec_server_telemetry;
+mod local_defaults;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod mcp_login;
@@ -1030,7 +1031,9 @@ async fn cli_main(
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = MultitoolCli::parse_from(local_defaults::apply_local_defaults(
+        std::env::args_os().collect(),
+    ));
     // Retain the launch target through TUI exit, even if a launcher changes selection.
     let daemon_cli_executable = arg0_paths
         .codex_self_exe
