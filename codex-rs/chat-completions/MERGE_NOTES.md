@@ -162,3 +162,21 @@ The patch release branched from the same release base as 0.157.0, so it needed
 a second merge commit. Its Windows process-launch fixes merged without source
 conflicts. The workspace version in `Cargo.toml` was resolved to `0.157.1`,
 and Cargo regenerated the workspace package versions in `Cargo.lock`.
+
+## 2026-09-28: codex-local default flags
+
+Fork-only CLI hunks to retain on each upstream merge:
+
+- `cli/src/local_defaults.rs` and `cli/src/local_defaults_tests.rs` read
+  `default_args` from `<codex_home>/codex-local.toml`, insert allowed `-c`,
+  `-m`, and `-p` flags after argv[0] for runtime invocations, and honor
+  `CODEX_LOCAL_NO_DEFAULTS=1`.
+- `cli/src/main.rs` calls `apply_local_defaults` before `MultitoolCli` parsing.
+- `cli/Cargo.toml` adds `codex-utils-home-dir`, with the corresponding lockfile
+  entry.
+
+If upstream changes the runtime branch in `profile_v2_for_subcommand`, update
+`RUNTIME_SUBCOMMANDS`. Its parity test forces classification of new subcommands.
+The `-m` and `-p` deduplication uses clap argument IDs `model` and
+`config_profile_v2` from `SharedCliOptions`; update those constants if upstream
+renames the IDs.
