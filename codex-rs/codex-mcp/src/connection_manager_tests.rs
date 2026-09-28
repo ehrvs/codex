@@ -5999,42 +5999,101 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
 async fn reconciliation_updates_elicitation_policy_without_restarting_ready_server() {
     let runtime_context = reusable_server_runtime_context();
     let config = reusable_server_config("http://127.0.0.1:1");
-    let previous = manager_with_reusable_ready_server(
+    let mut previous = manager_with_reusable_ready_server(
         &config,
         &runtime_context,
         vec![create_test_tool("docs", "search")],
     )
     .await;
-    {
-        let mut authority = previous
-            .elicitation_requests
-            .authority
-            .lock()
-            .expect("elicitation authority lock");
-        let config = Arc::make_mut(
-            &mut authority
-                .as_mut()
-                .expect("test manager should have permission authority")
-                .config,
-        );
-        config.approval_policy = Constrained::allow_any(AskForApproval::Never);
-        config.permission_profile = PermissionProfile::Disabled;
+    let router = ElicitationRequestRouter::default();
+    previous.elicitation_requests = ElicitationRequestManager::new(
+        test_elicitation_config("docs", AskForApproval::Never, PermissionProfile::Disabled),
+        /*reviewer*/ None,
+        /*lifecycle*/ None,
+        router.clone(),
+    );
+    let (tx_event, events) = async_channel::unbounded();
+    let sender = previous.elicitation_requests.make_sender(
+        "docs".to_string(),
+        Some(tx_event),
+        &ClientMcpExtensions::default(),
+    );
+    let elicitation =
+        codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: "What should I say?".to_string(),
+            requested_schema: requested_user_input_schema(),
+        });
+    let response = ElicitationResponse {
+        action: ElicitationAction::Accept,
+        content: Some(serde_json::json!({"message": "continue"})),
+        meta: None,
+    };
+
+    for approval_policy in [
+        AskForApproval::OnRequest,
+        AskForApproval::Never,
+        AskForApproval::OnRequest,
+    ] {
+        let mcp_config =
+            test_elicitation_config("docs", approval_policy, PermissionProfile::default());
+        let reconciled = reconcile_reusable_server_with_mcp_config(
+            &previous,
+            "docs",
+            config.clone(),
+            runtime_context.clone(),
+            mcp_config.as_ref().clone(),
+        )
+        .await;
+        assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+        {
+            let authority = reconciled
+                .elicitation_requests
+                .authority
+                .lock()
+                .expect("elicitation authority lock");
+            let config = &authority.as_ref().expect("elicitation authority").config;
+            assert_eq!(config.approval_policy.value(), approval_policy);
+            assert_eq!(config.permission_profile, PermissionProfile::default());
+        }
+
+        // A sender captured before reconciliation must observe each policy update.
+        let mut pending = sender(NumberOrString::Number(7), elicitation.clone());
+        if approval_policy == AskForApproval::OnRequest {
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            let EventMsg::ElicitationRequest(request) =
+                events.try_recv().expect("user-input event").msg
+            else {
+                panic!("expected MCP elicitation");
+            };
+            let codex_protocol::mcp::RequestId::String(request_id) = request.id else {
+                panic!("expected Codex-owned string request ID");
+            };
+            router
+                .resolve(
+                    "docs".to_string(),
+                    NumberOrString::String(request_id.into()),
+                    response.clone(),
+                )
+                .await
+                .expect("user response should resolve the retained sender");
+            assert_eq!(pending.await.expect("elicitation should resolve"), response);
+        } else {
+            assert_eq!(
+                pending
+                    .now_or_never()
+                    .expect("a policy denial must not wait for user input")
+                    .expect("elicitation should receive a response"),
+                ElicitationResponse {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                    meta: None,
+                }
+            );
+        }
+        assert!(events.is_empty());
+        previous = reconciled;
     }
-
-    let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
-
-    assert!(previous.shares_test_connection_with(&reconciled, "docs"));
-    let authority = reconciled
-        .elicitation_requests
-        .authority
-        .lock()
-        .expect("elicitation authority lock");
-    let config = &authority
-        .as_ref()
-        .expect("reconciled manager should have permission authority")
-        .config;
-    assert_eq!(config.approval_policy.value(), AskForApproval::OnRequest);
-    assert_eq!(config.permission_profile, PermissionProfile::default());
 }
 
 #[tokio::test]

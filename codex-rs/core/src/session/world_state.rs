@@ -137,9 +137,8 @@ impl Session {
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
         if turn_context.config.include_permissions_instructions {
             let environment = step_context.environments.primary();
-            let permission_profile = step_context
-                .environments
-                .permission_profile_or_else(|| turn_context.permission_profile());
+            let permission_profile =
+                turn_context.permission_profile_for_environments(&step_context.environments);
             #[allow(deprecated)]
             let cwd = environment
                 .and_then(|environment| environment.cwd().to_abs_path().ok())
@@ -275,9 +274,7 @@ impl Session {
         let mut multi_agent_mode = MultiAgentModeState::new(
             super::multi_agents::effective_multi_agent_mode(step_context),
         );
-        if let Some(usage_hint_text) =
-            super::multi_agents::usage_hint_text(step_context, &turn_context.session_source)
-        {
+        if let Some(usage_hint_text) = super::multi_agents::usage_hint_text(step_context) {
             let usage_hint = MultiAgentUsageHintState::new(usage_hint_text);
             multi_agent_mode = multi_agent_mode.with_usage_hint(&usage_hint);
             world_state.add_section(usage_hint);

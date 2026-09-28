@@ -136,3 +136,21 @@ done | sort -rn
 ```
 
 Then assume the compile errors will outnumber the conflicts, and budget accordingly.
+## 2026-09-25: merge published rust-v0.157.0
+
+The fork now follows published `rust-v*` tags. Fetch upstream tags, branch from
+`ehrvs/main`, and merge the newest stable release tag with a merge commit. Keep
+that tag as an ancestor; do not squash or rebase the merge PR. Compare the
+result against the tag to confirm that only the fork's intended paths differ.
+
+This merge required the chat path to pass upstream's new `include_internal`
+argument using the same destination check as the Responses path. The chat tests
+were updated for the new model-client argument and provider fields. Local-model
+shell aliases remain hidden, but `exec` is omitted when Code Mode owns that
+tool name, avoiding a tool-registration collision. Regenerate schema and proto
+outputs from source when upstream changes them.
+
+Before merging each release tag, build the CLI; run the chat-completions crate,
+core chat suite, tool-planning tests, formatting and clippy checks; then make
+two live local-model runs that each invoke a shell tool. Record any unverified
+gate in the PR rather than treating a compile-only check as sufficient.

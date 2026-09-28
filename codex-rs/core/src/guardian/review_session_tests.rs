@@ -2,6 +2,7 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
+use crate::session::Submission;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -13,7 +14,6 @@ use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ErrorEvent;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -49,7 +49,6 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     .unwrap();
     params.parent_session = Arc::clone(&parent);
     params.parent_context = GuardianReviewContext::from(Arc::clone(&turn));
-    params.compaction_model_hash = Some("matching".to_owned());
     let evidence: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call_output", "call_id": "prior-inspection", "output": EVIDENCE
     }))
@@ -251,7 +250,6 @@ async fn test_review_params() -> GuardianReviewSessionParams {
             model_overridden: false,
             model_override: None,
         },
-        compaction_model_hash: None,
         reasoning_summary,
         personality,
         external_cancel: None,
@@ -261,6 +259,17 @@ async fn test_review_params() -> GuardianReviewSessionParams {
 
 #[tokio::test]
 async fn spawned_guardian_reuse_key_matches_inherited_instructions() {
+    struct SharedProvider;
+    impl codex_extension_api::ThreadInstructionsProvider for SharedProvider {
+        fn share_with_subagents(&self) -> bool {
+            true
+        }
+
+        fn load_thread_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
+            panic!("isolated reviewers must not load the parent's provider")
+        }
+    }
+
     let mut params = test_review_params().await;
     let latest = Some(Instructions {
         text: "latest thread instructions".to_string(),
@@ -274,6 +283,7 @@ async fn spawned_guardian_reuse_key_matches_inherited_instructions() {
     parent.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
         user: latest_global.clone(),
         thread: latest.clone(),
+        thread_provider: Some(Arc::new(SharedProvider)),
         ..Default::default()
     }));
     // Reproduce an update between reuse-key capture and reviewer creation.
@@ -306,7 +316,9 @@ async fn spawned_guardian_reuse_key_matches_inherited_instructions() {
     let review = manager.trunk().await.expect("prewarmed reviewer");
 
     assert_eq!(review.reuse_key, expected_key);
-    assert_eq!(review.session.inherited_instructions().await.thread, latest);
+    let inherited = review.session.inherited_instructions().await;
+    assert_eq!(inherited.thread, latest);
+    assert!(inherited.thread_provider.is_none());
     manager.shutdown().await;
 }
 
@@ -366,7 +378,7 @@ async fn guardian_review_session_config_change_invalidates_cached_session() {
         )
     );
 
-    assert_eq!(
+    assert_ne!(
         cached_reuse_key,
         GuardianReviewSessionReuseKey::from_spawn_config(
             &cached_spawn_config,
@@ -414,20 +426,20 @@ async fn guardian_review_session_config_change_invalidates_cached_session() {
         "changing the effective Node REPL policy must invalidate reviewer history"
     );
 
-    let mut compaction_enabled_config = cached_spawn_config;
-    compaction_enabled_config
+    let mut compaction_disabled_config = cached_spawn_config;
+    compaction_disabled_config
         .features
-        .enable(Feature::GuardianReuseParentCompaction)
+        .disable(Feature::GuardianReuseParentCompaction)
         .expect("Guardian parent-compaction reuse should be configurable");
-    assert_ne!(
+    assert_eq!(
         GuardianReviewSessionReuseKey::from_spawn_config(
-            &compaction_enabled_config,
+            &compaction_disabled_config,
             SessionInstructions::default(),
             /*parent_history_version*/ 0,
             GuardianContextMode::Legacy,
         ),
         GuardianReviewSessionReuseKey::from_spawn_config(
-            &compaction_enabled_config,
+            &compaction_disabled_config,
             SessionInstructions::default(),
             /*parent_history_version*/ 1,
             GuardianContextMode::Legacy,
@@ -441,9 +453,6 @@ async fn guardian_review_session_config_change_invalidates_cached_session() {
 async fn encrypted_parent_compaction_requires_original_item_id(thread_context_enabled: bool) {
     let (session, _) = crate::session::tests::make_session_and_context().await;
     let mut features = session.get_config().await.features.clone();
-    features
-        .enable(Feature::GuardianReuseParentCompaction)
-        .expect("legacy reuse");
     features
         .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
         .expect("context mode");
@@ -467,7 +476,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
     }]);
     assert_eq!(
         policy
-            .parent_compaction(&history, Some("compatible"))
+            .parent_compaction(&history)
             .expect("valid checkpoint"),
         Some(item)
     );
@@ -482,7 +491,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
         .into(),
     );
     history.replace_annotated(items);
-    let result = policy.parent_compaction(&history, Some("compatible"));
+    let result = policy.parent_compaction(&history);
     if thread_context_enabled {
         assert!(result.is_err());
     } else {
@@ -570,47 +579,6 @@ async fn guardian_review_session_compact_scope_change_invalidates_cached_session
     assert_ne!(cached_reuse_key, next_reuse_key);
 }
 
-#[tokio::test]
-async fn guardian_review_session_config_disables_hooks() {
-    let mut parent_config = crate::config::test_config().await;
-    parent_config
-        .features
-        .enable(Feature::CodexHooks)
-        .expect("enable hooks on parent config");
-
-    let guardian_config = build_guardian_review_session_config(
-        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
-        /*live_network_config*/ None,
-        "active-model",
-        /*reasoning_effort*/ None,
-        ReasoningSummaryConfig::default(),
-        /*personality*/ None,
-        ResolvedModelMessages::bundled(),
-    )
-    .expect("guardian config");
-
-    assert!(!guardian_config.features.enabled(Feature::CodexHooks));
-}
-
-#[tokio::test]
-async fn guardian_review_session_config_disables_skill_instructions() {
-    let mut parent_config = crate::config::test_config().await;
-    parent_config.include_skill_instructions = true;
-
-    let guardian_config = build_guardian_review_session_config(
-        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
-        /*live_network_config*/ None,
-        "active-model",
-        /*reasoning_effort*/ None,
-        ReasoningSummaryConfig::default(),
-        /*personality*/ None,
-        ResolvedModelMessages::bundled(),
-    )
-    .expect("guardian config");
-
-    assert!(!guardian_config.include_skill_instructions);
-}
-
 #[test_case::test_case(
     Some("Use the managed Guardian policy."),
     Some("Configured Guardian template:\n{{ tenant_policy_config }}"),
@@ -687,23 +655,13 @@ async fn guardian_review_session_config_resolves_policy_and_template(
         Some(
             GuardianPolicyInstructions::new(
                 expected_policy,
+                "",
                 expected_template,
                 guardian_output_contract_prompt(),
             )
             .render()
         )
     );
-}
-
-#[test]
-fn had_prior_review_context_tracks_prompt_mode() {
-    assert!(!had_prior_review_context(&GuardianPromptMode::Full));
-    assert!(had_prior_review_context(&GuardianPromptMode::Delta {
-        cursor: GuardianTranscriptCursor {
-            parent_history_version: 7,
-            transcript_entry_count: 42,
-        }
-    }));
 }
 
 #[test]
@@ -845,41 +803,6 @@ async fn run_review_removes_trunk_when_event_stream_is_broken() {
         GuardianReviewSessionOutcome::Completed(Err(_))
     ));
     assert!(manager.trunk().await.is_none());
-}
-
-#[tokio::test]
-async fn wait_for_guardian_review_ignores_prior_turn_completion() {
-    let (review_session, tx_event, _rx_sub) = test_review_session().await;
-    tx_event
-        .send(turn_complete_event("prior-turn", Some("stale"), Some(9)))
-        .await
-        .expect("queue prior turn completion");
-    tx_event
-        .send(turn_complete_event("current-turn", Some("fresh"), Some(42)))
-        .await
-        .expect("queue current turn completion");
-
-    let mut analytics_result = GuardianReviewAnalyticsResult::without_session();
-    let codex_guardian_reviewer::ReviewTurnResult {
-        outcome,
-        disposition,
-        turn_completed,
-    } = wait_for_guardian_review(
-        &review_session,
-        "current-turn",
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        /*external_cancel*/ None,
-        &mut analytics_result,
-    )
-    .await;
-
-    let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
-        panic!("expected current turn completion");
-    };
-    assert_eq!(last_agent_message.as_deref(), Some("fresh"));
-    assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
-    assert_eq!(disposition, SessionDisposition::Reusable);
-    assert!(turn_completed);
 }
 
 #[tokio::test]

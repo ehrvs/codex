@@ -117,7 +117,11 @@ async fn drive_stream<S, E>(
     let mut finish_reason_seen: Option<String> = None;
 
     // Emit Created first.
-    if tx.send(Ok(ResponseEvent::Created { response_id: None })).await.is_err() {
+    if tx
+        .send(Ok(ResponseEvent::Created { response_id: None }))
+        .await
+        .is_err()
+    {
         return;
     }
 

@@ -1,3 +1,4 @@
+use crate::agent::types::ResolvedMultiAgentV2UsageHints;
 use crate::config::MultiAgentV2Config;
 use crate::context::MultiAgentRoleInstructions;
 use crate::session::step_context::StepContext;
@@ -10,16 +11,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ResolvedMultiAgentV2UsageHints {
-    pub(crate) root: Option<MultiAgentRoleInstructions>,
-    pub(crate) subagent: Option<MultiAgentRoleInstructions>,
-}
-
-pub(super) fn usage_hint_text(
-    step_context: &StepContext,
-    session_source: &SessionSource,
-) -> Option<MultiAgentRoleInstructions> {
+pub(super) fn usage_hint_text(step_context: &StepContext) -> Option<MultiAgentRoleInstructions> {
     let turn_context = step_context.turn.as_ref();
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
@@ -32,7 +24,7 @@ pub(super) fn usage_hint_text(
         multi_agent_messages,
         !turn_context.config.update_plan_enabled && turn_context.config.model_catalog.is_none(),
     );
-    match session_source {
+    match &turn_context.session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => snapshot.subagent,
         SessionSource::Cli
         | SessionSource::VSCode
