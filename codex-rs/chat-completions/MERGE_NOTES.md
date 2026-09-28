@@ -136,6 +136,7 @@ done | sort -rn
 ```
 
 Then assume the compile errors will outnumber the conflicts, and budget accordingly.
+
 ## 2026-09-25: merge published rust-v0.157.0
 
 The fork now follows published `rust-v*` tags. Fetch upstream tags, branch from
@@ -154,3 +155,10 @@ Before merging each release tag, build the CLI; run the chat-completions crate,
 core chat suite, tool-planning tests, formatting and clippy checks; then make
 two live local-model runs that each invoke a shell tool. Record any unverified
 gate in the PR rather than treating a compile-only check as sufficient.
+
+## 2026-09-28: merge published rust-v0.157.1
+
+The patch release branched from the same release base as 0.157.0, so it needed
+a second merge commit. Its Windows process-launch fixes merged without source
+conflicts. The workspace version in `Cargo.toml` was resolved to `0.157.1`,
+and Cargo regenerated the workspace package versions in `Cargo.lock`.
