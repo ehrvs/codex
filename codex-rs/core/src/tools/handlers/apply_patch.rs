@@ -24,8 +24,8 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
-use crate::tools::handlers::file_system_sandbox_policy_context_for_cwd;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_function_tool;
+use crate::tools::handlers::file_system_sandbox_policy_context_for_cwd;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
@@ -38,6 +38,7 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
+use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::ApplyPatchFileUpdateMode;
@@ -47,8 +48,8 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::openai_models::ApplyPatchToolType;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -590,16 +591,14 @@ async fn execute_verified_patch(
 ) -> Result<String, FunctionCallError> {
     let cwd = action.cwd.clone();
     let sandbox_context = turn_environment.sandbox_context(/*additional_permissions*/ None);
-    let Some(policy_context) = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd)
-    else {
-        return Err(FunctionCallError::RespondToModel(
-            "apply_patch requires an executor cwd".to_string(),
-        ));
-    };
+    let policy_context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd);
     let sandbox_route = if turn_environment.environment.is_remote() {
         PatchSandboxRoute::ExecutorManaged
     } else {
-        PatchSandboxRoute::Platform(turn_environment.config().windows_sandbox_level)
+        PatchSandboxRoute::Platform(windows_sandbox_level_for_legacy_checks(
+            turn_environment.config().windows_sandbox_type,
+            turn_environment.config().windows_sandbox_level,
+        ))
     };
     let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
         effective_patch_permissions(

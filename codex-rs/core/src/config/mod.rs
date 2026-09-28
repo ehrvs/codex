@@ -6,7 +6,7 @@ use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
-use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
+use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_agent_roles::load_agent_roles;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerSource;
@@ -216,7 +216,9 @@ pub use permissions::resolve_permission_profile;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 pub use token_budget_startup::TokenBudgetStartupConfig;
 pub use windows_sandbox_config::PreparedWindowsSandboxConfig;
+use windows_sandbox_config::network_config_allows_mxc;
 pub use windows_sandbox_config::prepare_windows_sandbox_config;
+use windows_sandbox_config::resolve_windows_sandbox_type;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
@@ -347,10 +349,8 @@ pub struct Permissions {
     /// Effective Windows sandbox mode derived from `[windows].sandbox` or
     /// legacy feature keys.
     pub windows_sandbox_mode: Option<WindowsSandboxModeToml>,
-    /// Selected Windows sandbox implementation, separate from the legacy setup level.
+    /// Configured Windows backend; use `Config::effective_local_windows_sandbox_type()` for local selection.
     pub windows_sandbox_type: SandboxType,
-    /// Whether the final Windows sandboxed child should run on a private desktop.
-    pub windows_sandbox_private_desktop: bool,
 }
 
 impl Permissions {
@@ -372,7 +372,6 @@ impl Permissions {
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             windows_sandbox_mode: None,
             windows_sandbox_type: SandboxType::None,
-            windows_sandbox_private_desktop: true,
         })
     }
 
@@ -608,6 +607,10 @@ pub enum ThreadStoreConfig {
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// App-server-owned destination policy; other runtimes remain unmanaged.
+    pub application_network_policy: codex_http_client::NetworkPolicy,
+    /// Auth bootstrap routing installed by the app-server configuration owner.
+    pub application_auth_route_config: Option<AuthRouteConfig>,
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
     pub config_layer_stack: ConfigLayerStack,
@@ -637,6 +640,10 @@ pub struct Config {
     /// Controls whether `model_auto_compact_token_limit` applies to the full
     /// active context or only tokens after the carried compaction-window prefix.
     pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
+
+    /// Percentage of the usable context window that triggers turn-end compaction.
+    /// Zero disables turn-end compaction.
+    pub model_post_turn_compact_threshold_percent: u8,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -691,6 +698,10 @@ pub struct Config {
     /// guardian developer prompt.
     pub guardian_policy_config: Option<String>,
 
+    /// Additional Guardian policy from requirements.toml or config.toml.
+    /// Rendered into `{{ extra_policy }}` alongside the resolved tenant policy.
+    pub guardian_extra_policy: Option<String>,
+
     /// Guardian prompt template override from config.toml.
     /// The resolved policy config replaces its `{{ tenant_policy_config }}`
     /// placeholder when a review session is built.
@@ -711,8 +722,8 @@ pub struct Config {
     /// Optional token budget override for the available-skills catalog.
     pub skill_max_context_tokens: Option<NonZeroUsize>,
 
-    /// Whether orchestrator-owned skills are exposed to the model.
-    pub orchestrator_skills_enabled: bool,
+    /// Whether cloud skills are discovered and exposed to the model.
+    pub cloud_skill_enabled: bool,
 
     /// Whether orchestrator-owned MCP tools are exposed to the model.
     pub orchestrator_mcp_enabled: bool,
@@ -751,8 +762,11 @@ pub struct Config {
     /// Enable ASCII animations and shimmer effects in the TUI.
     pub animations: bool,
 
-    /// Enable decorative TUI effects such as Astra composer stars.
-    pub tui_whimsy: bool,
+    /// Individual TUI effects, subordinate to the animation master switch.
+    pub tui_effects: codex_config::types::TuiEffects,
+
+    /// Rich content rendering preferences, independent of animations.
+    pub tui_rendering: codex_config::types::TuiRendering,
 
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
@@ -772,6 +786,9 @@ pub struct Config {
 
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     pub tui_raw_output_mode: bool,
+
+    /// Own the fullscreen transcript when the alternate screen is enabled.
+    pub tui_fullscreen_transcript: bool,
 
     /// Start the TUI in the specified collaboration mode (plan/default).
 
@@ -1082,6 +1099,9 @@ pub struct Config {
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
 
+    /// Local rollout preference after checking network restrictions and native availability.
+    pub prefer_mxc: bool,
+
     /// When `true`, suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: bool,
 
@@ -1130,6 +1150,10 @@ const DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS: u64 = 30_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
     pub default_exec_yield_time_ms: u64,
+    /// Show handler duration, code-mode host duration, and harness overhead
+    /// in each code-mode cell response.
+    /// Experimental: this option and the response format may change or be removed.
+    pub experimental_show_cell_overhead: bool,
     pub excluded_tool_namespaces: Vec<String>,
     pub direct_only_tool_namespaces: Vec<String>,
     /// Keep code mode fail-closed when the standalone host is unavailable.
@@ -1140,6 +1164,7 @@ impl Default for CodeModeConfig {
     fn default() -> Self {
         Self {
             default_exec_yield_time_ms: DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS,
+            experimental_show_cell_overhead: false,
             excluded_tool_namespaces: Vec::new(),
             direct_only_tool_namespaces: Vec::new(),
             disable_in_process_fallback: false,
@@ -1639,7 +1664,14 @@ impl Config {
 
     /// Returns auth routing resolved from the effective feature configuration.
     pub fn auth_route_config(&self) -> AuthRouteConfig {
-        AuthRouteConfig::from_http_client_factory(self.http_client_factory())
+        self.application_auth_route_config
+            .clone()
+            .unwrap_or_else(|| {
+                AuthRouteConfig::from_http_client_factory(
+                    self.http_client_factory()
+                        .with_network_policy(self.application_network_policy.clone()),
+                )
+            })
     }
 
     /// Creates the HTTP client factory resolved from the effective feature configuration.
@@ -1649,7 +1681,11 @@ impl Config {
         } else {
             OutboundProxyPolicy::ReqwestDefault
         };
-        let factory = HttpClientFactory::new(outbound_proxy_policy);
+        let mut factory = HttpClientFactory::new(outbound_proxy_policy)
+            .with_network_policy(self.application_network_policy.clone());
+        if !self.respect_system_proxy && self.features.enabled(Feature::SystemProxyFallback) {
+            factory = factory.with_system_proxy_fallback();
+        }
         if self.features.enabled(Feature::Psp) {
             factory.with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
         } else {
@@ -1666,6 +1702,7 @@ impl Config {
             self.features.enabled(Feature::RemotePlugin),
             self.chatgpt_base_url.clone(),
             self.http_client_factory(),
+            self.apps_mcp_product_sku.clone(),
         )
     }
 
@@ -1848,22 +1885,16 @@ impl Config {
     pub async fn rebuild_with_session_layers(
         session_layers: &ConfigLayerStack,
         cwd: PathBuf,
-        refreshed_config: &Config,
+        refreshed_layers: &ConfigLayerStack,
+        codex_home: AbsolutePathBuf,
+        default_zsh_path: Option<AbsolutePathBuf>,
     ) -> std::io::Result<Self> {
-        let config_layer_stack = Self::layer_stack_preserving_session(
-            session_layers,
-            &refreshed_config.config_layer_stack,
-        )?;
+        let config_layer_stack =
+            Self::layer_stack_preserving_session(session_layers, refreshed_layers)?;
         let cfg: ConfigToml = config_layer_stack
             .effective_config()
             .try_into()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        let default_zsh_path = refreshed_config
-            .zsh_path
-            .clone()
-            .map(AbsolutePathBuf::try_from)
-            .transpose()?;
-
         Self::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
             cfg,
@@ -1872,7 +1903,7 @@ impl Config {
                 default_zsh_path,
                 ..Default::default()
             },
-            refreshed_config.codex_home.clone(),
+            codex_home,
             config_layer_stack,
         )
         .await
@@ -2668,9 +2699,7 @@ fn resolve_update_plan_enabled(config_toml: &ConfigToml) -> bool {
         .is_some_and(|config| config.enabled)
 }
 
-fn resolve_orchestrator_feature_enabled(
-    feature: Option<&codex_config::config_toml::OrchestratorFeatureToml>,
-) -> bool {
+fn resolve_feature_enabled(feature: Option<&codex_config::config_toml::FeatureToggleToml>) -> bool {
     feature.and_then(|feature| feature.enabled).unwrap_or(true)
 }
 
@@ -2689,6 +2718,9 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
         default_exec_yield_time_ms: base
             .and_then(|config| config.default_exec_yield_time_ms)
             .unwrap_or(DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS),
+        experimental_show_cell_overhead: base
+            .and_then(|config| config.experimental_show_cell_overhead)
+            .unwrap_or_default(),
         excluded_tool_namespaces: base
             .and_then(|config| config.excluded_tool_namespaces.as_ref())
             .cloned()
@@ -2978,17 +3010,8 @@ pub fn resolve_bootstrap_respect_system_proxy(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<bool> {
-    let configured_features = Features::from_sources(
-        FeatureConfigSource {
-            features: cfg.features.as_ref(),
-            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-    let features =
-        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
-    Ok(features.get().enabled(Feature::RespectSystemProxy))
+    resolve_bootstrap_http_client_factory(cfg, feature_requirements)
+        .map(|factory| factory.outbound_proxy_policy() == OutboundProxyPolicy::RespectSystemProxy)
 }
 
 /// Resolves auth route settings for the initial cloud-config bootstrap.
@@ -3005,14 +3028,28 @@ pub fn resolve_bootstrap_http_client_factory(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<HttpClientFactory> {
-    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements).map(|respect_system_proxy| {
-        let outbound_proxy_policy = if respect_system_proxy {
-            OutboundProxyPolicy::RespectSystemProxy
-        } else {
-            OutboundProxyPolicy::ReqwestDefault
-        };
-        HttpClientFactory::new(outbound_proxy_policy)
-    })
+    let configured_features = Features::from_sources(
+        FeatureConfigSource {
+            features: cfg.features.as_ref(),
+            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    let features =
+        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
+    let outbound_proxy_policy = if features.enabled(Feature::RespectSystemProxy) {
+        OutboundProxyPolicy::RespectSystemProxy
+    } else {
+        OutboundProxyPolicy::ReqwestDefault
+    };
+    let mut factory = HttpClientFactory::new(outbound_proxy_policy);
+    if outbound_proxy_policy == OutboundProxyPolicy::ReqwestDefault
+        && features.enabled(Feature::SystemProxyFallback)
+    {
+        factory = factory.with_system_proxy_fallback();
+    }
+    Ok(factory)
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(
@@ -3178,6 +3215,12 @@ impl Config {
 
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if cfg.model_post_turn_compact_threshold_percent.is_some_and(|percent| percent > 100) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "model_post_turn_compact_threshold_percent must be between 0 and 100",
+            ));
+        }
         if let Some(responses_api_metadata) = cfg.responses_api_metadata.as_ref() {
             validate_extra_metadata(responses_api_metadata.iter()).map_err(|message| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
@@ -3190,10 +3233,14 @@ impl Config {
                 .as_ref(),
         )?;
         let orchestrator = cfg.orchestrator.as_ref();
-        let orchestrator_skills_enabled =
-            resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.skills.as_ref()));
+        let cloud_skill_enabled = cfg
+            .cloud
+            .as_ref()
+            .and_then(|cloud| cloud.skills.as_ref())
+            .and_then(|skills| skills.enabled)
+            .unwrap_or(true);
         let orchestrator_mcp_enabled =
-            resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.mcp.as_ref()));
+            resolve_feature_enabled(orchestrator.and_then(|value| value.mcp.as_ref()));
         let mut startup_warnings = config_layer_stack
             .startup_warnings()
             .unwrap_or_default()
@@ -3224,7 +3271,6 @@ impl Config {
             auto_review_required_models: _,
             permission_profile: mut constrained_permission_profile,
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
-            windows_sandbox_private_desktop: _,
             web_search_mode: mut constrained_web_search_mode,
             allow_managed_hooks_only: _,
             allow_appshots: _,
@@ -3242,6 +3288,7 @@ impl Config {
             filesystem: filesystem_requirements,
             additional_developer_instructions: _,
             guardian_policy_config_source: _,
+            guardian_extra_policy_source: _,
         } = config_layer_stack.requirements().clone();
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
@@ -3357,7 +3404,6 @@ impl Config {
             &mut constrained_windows_sandbox_mode,
             &mut startup_warnings,
         )?;
-        let windows_sandbox_private_desktop = resolve_windows_sandbox_private_desktop(&cfg);
         let resolved_cwd = AbsolutePathBuf::try_from(normalize_for_native_workdir({
             use std::env;
 
@@ -3436,6 +3482,22 @@ impl Config {
             default_permissions_override.as_deref(),
             permission_config_syntax,
         );
+        let prefer_mxc = features.enabled(Feature::PreferMxc)
+            && network_config_allows_mxc(
+                &effective_permission_selection,
+                profiles_are_active,
+                permission_profile.as_ref(),
+                network_requirements.as_ref(),
+                cfg.features.as_ref(),
+                enable_network_proxy,
+            )?
+            && codex_sandboxing::windows_mxc_available();
+        let local_windows_sandbox_type =
+            resolve_windows_sandbox_type(windows_sandbox_type, prefer_mxc);
+        let legacy_windows_sandbox_level = windows_sandbox_level_for_legacy_checks(
+            local_windows_sandbox_type,
+            windows_sandbox_level,
+        );
         let explicit_permission_profile_mode = effective_permission_selection
             .persisted_profile_id_was_provided
             || default_permissions_override.is_some()
@@ -3507,7 +3569,7 @@ impl Config {
                         .unwrap_or_else(|| {
                             default_builtin_permission_profile_name(
                                 &active_project,
-                                windows_sandbox_level,
+                                legacy_windows_sandbox_level,
                             )
                         });
                     network_proxy_config_for_profile_selection(
@@ -3528,7 +3590,10 @@ impl Config {
             let default_permissions = effective_permission_selection
                 .selected_profile_id
                 .unwrap_or_else(|| {
-                    default_builtin_permission_profile_name(&active_project, windows_sandbox_level)
+                    default_builtin_permission_profile_name(
+                        &active_project,
+                        legacy_windows_sandbox_level,
+                    )
                 });
             let builtin_workspace_write_settings = if using_implicit_builtin_profile {
                 cfg.sandbox_workspace_write.as_ref().map(|settings| WorkspaceWriteSettings {
@@ -3593,7 +3658,7 @@ impl Config {
             let mut permission_profile = cfg
                 .derive_permission_profile(
                     sandbox_mode,
-                    windows_sandbox_level,
+                    legacy_windows_sandbox_level,
                     Some(&active_project),
                     Some(&constrained_permission_profile),
                 )
@@ -3931,6 +3996,17 @@ impl Config {
                             auto_review.policy.as_deref(),
                         ))
                 });
+        let guardian_extra_policy = normalize_guardian_policy_config(
+            config_layer_stack
+                .requirements_toml()
+                .guardian_extra_policy
+                .as_deref(),
+        )
+        .or_else(|| {
+            cfg.auto_review.as_ref().and_then(|auto_review| {
+                normalize_guardian_policy_config(auto_review.extra_policy.as_deref())
+            })
+        });
         let guardian_policy_template = cfg
             .auto_review
             .as_ref()
@@ -4158,6 +4234,7 @@ impl Config {
         .map_err(std::io::Error::from)?;
         let otel = otel::resolve_config(cfg.otel.unwrap_or_default(), &mut startup_warnings);
         let config = Self {
+            prefer_mxc,
             model,
             service_tier,
             review_model,
@@ -4166,6 +4243,9 @@ impl Config {
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_auto_compact_token_limit_scope: cfg
                 .model_auto_compact_token_limit_scope
+                .unwrap_or_default(),
+            model_post_turn_compact_threshold_percent: cfg
+                .model_post_turn_compact_threshold_percent
                 .unwrap_or_default(),
             model_provider_id,
             model_provider,
@@ -4183,7 +4263,6 @@ impl Config {
                 shell_environment_policy,
                 windows_sandbox_mode,
                 windows_sandbox_type,
-                windows_sandbox_private_desktop,
             },
             explicit_permission_profile_mode,
             custom_permission_profiles,
@@ -4200,7 +4279,7 @@ impl Config {
             include_collaboration_mode_instructions,
             include_skill_instructions,
             skill_max_context_tokens,
-            orchestrator_skills_enabled,
+            cloud_skill_enabled,
             orchestrator_mcp_enabled,
             include_environment_context,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
@@ -4268,6 +4347,8 @@ impl Config {
             sqlite: codex_state::SqliteConfig::from_sqlite_home(sqlite_home),
             log_dir,
             config_layer_stack,
+            application_network_policy: Default::default(),
+            application_auth_route_config: None,
             history,
             ephemeral: ephemeral.unwrap_or_default(),
             extra_config: None,
@@ -4284,6 +4365,7 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
+            guardian_extra_policy,
             guardian_policy_template,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
@@ -4364,7 +4446,8 @@ impl Config {
                 .map(|t| t.notification_settings.clone())
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
-            tui_whimsy: cfg.tui.as_ref().map(|t| t.whimsy).unwrap_or(true),
+            tui_effects: cfg.tui.as_ref().map(|t| t.effects).unwrap_or_default(),
+            tui_rendering: cfg.tui.as_ref().map(|t| t.rendering).unwrap_or_default(),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
             tui_show_server_version_notice: cfg
                 .tui
@@ -4388,6 +4471,10 @@ impl Config {
                 .as_ref()
                 .map(|t| t.raw_output_mode)
                 .unwrap_or(false),
+            tui_fullscreen_transcript: cfg
+                .tui
+                .as_ref()
+                .is_none_or(|tui| tui.fullscreen_transcript),
             tui_alternate_screen: cfg
                 .tui
                 .as_ref()

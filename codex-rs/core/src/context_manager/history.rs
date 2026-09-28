@@ -381,6 +381,12 @@ impl ContextManager {
         self.world_state_baseline = Some(snapshot);
     }
 
+    pub(crate) fn world_state_checkpoint(&self) -> Option<WorldStateItem> {
+        self.world_state_baseline
+            .clone()
+            .map(|snapshot| WorldStateItem::full(snapshot.into_object()))
+    }
+
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
@@ -445,6 +451,12 @@ impl ContextManager {
                 review_history.record(&processed.item);
             }
             Arc::make_mut(&mut self.items).push(processed);
+            if self.guardian_context_mode == GuardianContextMode::ThreadOwned
+                && let Some(metadata) = metadata
+                && Arc::make_mut(&mut self.retained_context).record_sender_user_messages(metadata)
+            {
+                self.user_message_revision = self.user_message_revision.saturating_add(1);
+            }
             self.record_user_authorization(
                 item,
                 metadata,
@@ -484,17 +496,14 @@ impl ContextManager {
         &self.items
     }
 
-    /// Returns raw items in the history and consumes the snapshot.
-    pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
-        self.into_annotated_items()
-            .into_iter()
-            .map(ResponseItemEnvelope::into_item)
-            .collect()
-    }
-
     /// Returns annotated history items and consumes the snapshot.
     pub(crate) fn into_annotated_items(self) -> Vec<ResponseItemEnvelope> {
-        Arc::unwrap_or_clone(self.items)
+        Arc::unwrap_or_clone(self.into_shared_annotated_items())
+    }
+
+    /// Keeps shared response items while releasing the snapshot's unrelated metadata.
+    pub(crate) fn into_shared_annotated_items(self) -> Arc<Vec<ResponseItemEnvelope>> {
+        self.items
     }
 
     pub(crate) fn history_version(&self) -> u64 {
@@ -890,6 +899,7 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
 /// Returns the same coarse, model-visible token estimate used for full history estimates.
 ///
 /// Counts content directly, excluding transport IDs, metadata, and outer JSON escaping.
+/// Original-detail file images use the maximum patch count.
 pub(crate) fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
@@ -918,7 +928,6 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option
     });
 
 fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
-    // TODO(kc) Account for file-backed image size after its token-cost contract is defined.
     match item {
         ResponseItem::Message { content, .. } => content
             .iter()
@@ -926,14 +935,9 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
                 ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                     text_bytes(text)
                 }
-                ContentItem::InputImage {
-                    image: ImageReference::Inline { image_url },
-                    detail,
-                } => estimate_image_bytes(image_url, *detail),
-                ContentItem::InputImage {
-                    image: ImageReference::File { .. },
-                    ..
-                } => 0,
+                ContentItem::InputImage { image, detail } => {
+                    estimate_image_reference_bytes(image, *detail)
+                }
                 ContentItem::InputAudio { audio_url } => estimate_audio_bytes(audio_url),
             })
             .fold(0i64, i64::saturating_add),
@@ -1112,13 +1116,28 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
     })
 }
 
-/// Shared image estimate, excluding message framing.
-pub(crate) fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
+/// Inline image estimate, excluding the data URL prefix and message framing.
+fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
     match detail {
         Some(ImageDetail::Original) => {
             estimate_original_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)
         }
         _ => RESIZED_IMAGE_BYTES_ESTIMATE,
+    }
+}
+
+/// Image estimate for callers that only have the reference. Original-detail file images use the
+/// maximum patch count because their dimensions are not available from the reference.
+pub(crate) fn estimate_image_reference_bytes(
+    image: &ImageReference,
+    detail: Option<ImageDetail>,
+) -> i64 {
+    match image {
+        ImageReference::Inline { image_url } => estimate_image_bytes(image_url, detail),
+        ImageReference::File { .. } if detail == Some(ImageDetail::Original) => {
+            i64::try_from(approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES)).unwrap_or(i64::MAX)
+        }
+        ImageReference::File { .. } => RESIZED_IMAGE_BYTES_ESTIMATE,
     }
 }
 
@@ -1136,14 +1155,9 @@ fn estimate_function_output_bytes(output: &FunctionCallOutputBody) -> i64 {
             .iter()
             .map(|part| match part {
                 FunctionCallOutputContentItem::InputText { text } => text_bytes(text),
-                FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::Inline { image_url },
-                    detail,
-                } => estimate_image_bytes(image_url, *detail),
-                FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::File { .. },
-                    ..
-                } => 0,
+                FunctionCallOutputContentItem::InputImage { image, detail } => {
+                    estimate_image_reference_bytes(image, *detail)
+                }
                 FunctionCallOutputContentItem::InputAudio { audio_url } => {
                     estimate_audio_bytes(audio_url)
                 }

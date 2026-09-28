@@ -28,6 +28,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::LoadThreadHistoryParams;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::assert_parent_turn;
@@ -67,6 +68,7 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::Level;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_test::internal::MockWriter;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -74,6 +76,9 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 use super::direct_tool_metadata::tool_call_metadata;
+
+#[path = "spawn_settings_tests.rs"]
+mod spawn_settings_tests;
 
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
@@ -1101,6 +1106,15 @@ async fn spawned_child_receives_forked_parent_context(
             .as_str()
             .expect("legacy child thread id"),
     )?;
+    // Read the acknowledged fork from storage without flushing the live child first.
+    let reopened_store = codex_core::thread_store_from_config(&test.config, /*state_db*/ None);
+    let persisted = reopened_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_thread_id,
+            include_archived: false,
+        })
+        .await?;
+    assert!(serde_json::to_string(&persisted.items)?.contains(TURN_0_FORK_PROMPT));
     let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while !matches!(child_thread.agent_status().await, AgentStatus::Completed(_)) {
@@ -2212,6 +2226,11 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
         .with_writer(MockWriter::new(output))
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Keep two dispatchers alive so a parallel test that first registers a communication
+    // callsite without a subscriber cannot globally disable it for our capturing subscriber.
+    let _parallel_dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::OFF),
+    );
 
     let server = start_mock_server().await;
     let message = if plaintext {
